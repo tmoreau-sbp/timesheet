@@ -1,0 +1,10 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 10  # same cool-off as pinact
+    commit-message:
+      prefix: ci  # Conventional Commits: "ci: bump …"

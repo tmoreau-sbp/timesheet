@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release, commit CHANGELOG.md
+      id-token: write      # sign the attestation
+      attestations: write  # store the attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0  # git-cliff needs the full history
+          persist-credentials: false
+      - name: Test
+        run: python3 -m unittest discover -s tests
+      - name: Stamp version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          sed -i "s/^VERSION = \"dev\"/VERSION = \"$version\"/" timesheet.py
+          python3 timesheet.py --help | grep -q "timesheet $version"
+          mkdir dist
+          install -m 755 timesheet.py dist/timesheet.py
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        id: attest
+        with:
+          subject-path: dist/timesheet.py
+      - name: Release notes
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          version: v2.14.2
+          args: --latest --strip all
+        env:
+          OUTPUT: notes.md
+      - name: Changelog
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          version: v2.14.2
+          args: --verbose  # full CHANGELOG.md
+        env:
+          OUTPUT: CHANGELOG.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" dist/timesheet.py.sigstore.json
+          (cd dist && sha256sum timesheet.py > timesheet.py.sha256)
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
+      - name: Commit CHANGELOG.md to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Through the API, so GitHub signs the commit.
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md?ref=main" --jq .sha 2>/dev/null || true)
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md" \
+            -f message="docs(changelog): $TAG" -f branch=main \
+            -f content="$(base64 -w0 CHANGELOG.md)" ${current:+-f sha="$current"}
