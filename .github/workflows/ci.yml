@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ruff check
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4.1.0
+        with:
+          version: "0.17.0"
+          args: check --output-format=github
+      - name: ruff format
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4.1.0
+        with:
+          version: "0.17.0"
+          args: format --check --diff
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest  # /usr/bin/python3, the 3.9 users run (Command Line Tools)
+            python: system
+          - os: ubuntu-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.python != 'system'
+        with:
+          python-version: ${{ matrix.python }}
+      - run: ${{ matrix.python == 'system' && '/usr/bin/python3' || 'python' }} --version
+      - run: ${{ matrix.python == 'system' && '/usr/bin/python3' || 'python' }} -m unittest discover -s tests -v
+        env:
+          LANG: C.UTF-8
+
+  pinact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
+        with:
+          fix: "false"  # check only: fail if an action isn't pinned or is younger than 10 days
+          verify: "true"
+
+  commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Conventional Commits since the last release
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          version: v2.14.2
+          args: --unreleased  # cliff.toml: require_conventional = true

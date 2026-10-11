@@ -1,0 +1,6 @@
+# pinact: every action pinned to a full commit SHA with a correct version comment,
+# and no release younger than 10 days (supply-chain cool-off).
+version: 3
+min_age:
+  value: 10
+  always: true
