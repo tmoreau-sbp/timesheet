@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Implemented (v1) |
 | **Owner** | [@tmoreau-sbp](https://github.com/tmoreau-sbp) |
-| **Updated** | 2026-10-30 |
+| **Updated** | 2026-11-23 |
 | **Scope** | Design and rationale. Usage is in the [README](../README.md). |
 
 ## 1. Summary
@@ -68,6 +68,9 @@ It is a single Python 3.9+ standard-library script, run by the user in a termina
 | R31 | A browser profile or Teams calls can be split over several projects by %, set with the arrow keys | done |
 | R32 | A place can be linked to a project (or a split): work there with no other project signal counts for it | done |
 | R33 | Projects busy at the same time (agents side by side) share the time evenly | done |
+| R34 | Hours per day as a chart: one column per day stacked by project, weekends shaded, a dashed line and the date at each Saturday, gentle colours; an image in Ghostty, kitty or WezTerm, text elsewhere | done |
+| R35 | `--project` shows only some projects, in the calendar, the list and the chart | done |
+| R36 | Under every view: hours per weekend (Sat+Sun), the weekend share of the period, and average hours per day over all days, weekdays and weekend days | done |
 
 ## 4. Findings
 
@@ -433,6 +436,23 @@ Sun 2026-10-11
 
 With place labels (5.16), a `place` row follows `start` in the calendar: the label with most of the day's time, cut to 8 characters. In the list, each row ends with `@label`, the place at its start.
 
+Under every view, the weekend summary (R36) for the projects shown, plus `all work` when there is more than one:
+```text
+Weekends (Sat+Sun)      ■ ClientA ■ Internal  all work
+  Oct 03-04                   0.3       0.2       0.5
+  Oct 10-11                   6.2       1.4       7.6
+  total                       6.5       1.6       8.1
+  share of the period          7%        9%        8%
+
+Per day (average) days  ■ ClientA ■ Internal  all work
+  all days          14       6.50      1.21      7.71
+  weekdays          10       8.45      1.53      9.98
+  weekend days       4       1.63      0.40      2.03
+```
+- A weekend cut by the period (a lone Saturday or Sunday at an end) counts as it is.
+- Averages divide by calendar days, days without work and today included.
+- `*` marks values with estimated time, as in the calendar. The `■` is the project's chart colour, on a terminal only; numbers stay in the text colour.
+
 ### 5.11 Command line (R21)
 
 | Option | Meaning |
@@ -440,6 +460,8 @@ With place labels (5.16), a `place` row follows `start` in the calendar: the lab
 | `-w N`, `--weeks N` | show the last N weeks, Mon–Sun (default: `weeks` setting) |
 | `-n N`, `--days N` | show the last N days instead |
 | `--list` | one row per work period instead of the calendar |
+| `--chart` | hours per day as a chart instead of the calendar (5.17) |
+| `--project P` | only these projects, comma-separated (`DP` or `DP,TAT`), in every view; an unknown name is an error |
 | `--other` | also show time that is not work |
 | `--configure` | projects, what belongs to them, history |
 | `--settings` | day start, rounding and other numbers |
@@ -604,6 +626,21 @@ Work at a place with no folder, profile or call: which project? 1=ClientA  2=Int
 - A setup not labeled (a new desk, a new screen) is guessed from the records of labeled setups: the one label its network had, else the one label its screens had, else its USB devices. Several labels at a step pass on to the next; none at the end means no place.
 - The VPN isn't used yet. Reports show places only once there are labels (5.10).
 
+### 5.17 Chart: `--chart` (R34, R35)
+
+One column per day, projects stacked bottom-up in their configured order, the y axis from 0 to 12 h (or the longest day, rounded up to an even hour).
+- **Weekends:** Sat+Sun shaded. Their totals are in the weekend table below the chart, not on it.
+- **Saturdays:** a dashed line where each Saturday starts, labelled `Sat Oct 10`. When days are narrow, every k-th Saturday is labelled so labels never overlap.
+- **Estimates:** estimated hours are drawn lighter (45 % opacity) and get a legend entry.
+- **Colours:** the dataviz reference palette made gentler on the eyes (orange chroma 0.17 → 0.12, dark `#b1642f`, light `#c3723a`; the others 10–20 % less), still passing its validator in both modes (adjacent colour-blind ΔE ≥ 8, normal vision ≥ 15). Eight categorical slots in fixed order, light and dark steps; dark when macOS is in dark mode (`defaults read -g AppleInterfaceStyle`). A project keeps its slot under `--project`; `other` and a ninth project are neutral gray.
+
+**Image** (Ghostty, kitty, WezTerm; not through tmux or screen; not with `NO_COLOR`):
+1. Python writes the chart as SVG, in design units with a fixed height of 380 and a width that follows the terminal's shape, so text keeps its size and a wider window gives wider bars.
+2. macOS draws it: `osascript -l JavaScript` loads the SVG with AppKit (`NSImage`) and saves a PNG at the terminal's pixel size, in a temporary folder. About 0.15 s. AppKit's SVG support ignores bold and uses Helvetica Neue.
+3. The PNG is shown with the Kitty graphics protocol, `a=T,f=100,c=<columns>,r=<rows>`, in base64 chunks of 4096. It fills the terminal width; its height is 24 rows, less on a short window.
+
+**Text** elsewhere, or if drawing fails: 12 rows, a column per day as wide as the terminal allows (bar + one space). With colour, 24-bit colour and ⅛-row blocks, weekends shaded, estimates lighter; without, a pattern per project (`█ ▓ ▒ ░`) in whole rows. A `┊` marks where each Saturday starts, its date below, `*` under estimated days. When the days don't fit, the latest ones are shown and the line says so.
+
 ## 6. Security and privacy
 
 - **Local only.** No network access; nothing leaves the Mac.
@@ -639,7 +676,7 @@ Work at a place with no folder, profile or call: which project? 1=ClientA  2=Int
 
 ## 8. Testing and CI (R22)
 
-- **Suite:** `python3 -m unittest discover -s tests`. It has 44 tests in `tests/test_timesheet.py`, using only the standard library.
+- **Suite:** `python3 -m unittest discover -s tests`. It has 51 tests in `tests/test_timesheet.py`, using only the standard library.
 - **Isolation:**
   - Each test uses a throwaway home folder, fake power logs, fake browser databases and a fake `crontab` command.
   - The real power log, browsers and crontab are never touched.
@@ -653,6 +690,7 @@ Work at a place with no folder, profile or call: which project? 1=ClientA  2=Int
   - cron install and removal, and commands that hang (timeouts)
   - places: probe parsing without serials, the log (changes only, one year, mode 600), setup labels and guesses, the `--collect` consent check
   - the command line end to end: setup, report, history and places questions, place labels and projects, `--settings`, `--help`, uninstall
+  - the chart: weekend sums and share, averages per day, weekends cut at the ends of the period, the SVG (Saturday lines and dates, no weekend totals, estimates, colour kept under `--project`, no network references), the text chart without colour, the Kitty escape codes, and on macOS the PNG drawn by AppKit
   - the arrow-key folder browser and split slider, driven through a pseudo-terminal (arrows sent as `ESC O x`, the codes keypad mode expects, and `ESC [ x`)
 - **CI** (`.github/workflows/ci.yml`):
   - **lint:** `ruff check` and `ruff format --check`, with ruff fixed at 0.17.0 and settings in `ruff.toml` (Python 3.9, line length 100, rules E, F, W, I, B)
@@ -677,6 +715,7 @@ Work at a place with no folder, profile or call: which project? 1=ClientA  2=Int
   - File modification times keep only the latest change per file.
   - git reflog and Chrome history keep about 90 days; VS Code keeps 50 saves per file.
   - Claude transcripts keep 30 days; the prompt history keeps everything.
+- **The chart image needs Ghostty, kitty or WezTerm** and macOS. Elsewhere, through tmux or with `NO_COLOR` it falls back to text. It is drawn once: after resizing the window, run it again.
 - **Places are noted hourly.** A move shows at the next run the Mac is awake for, so a place can be up to an hour late, and a shorter visit can be missed.
 - **Places look the same when their parts do:** two units of a model without a serial, or two networks with the same router address and neither a domain nor a readable hardware address.
 - **Unconfirmed meanings,** inferred and not documented by Apple, Google or Mozilla:

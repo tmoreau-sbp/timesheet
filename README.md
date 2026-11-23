@@ -45,6 +45,8 @@ The second run asks once whether to keep a history beyond the 7 days macOS keeps
 | `./timesheet.py` | last 4 weeks, work only |
 | `./timesheet.py -w 2` | last 2 weeks |
 | `./timesheet.py -n 7 --list` | last 7 days, one row per work period |
+| `./timesheet.py -n 52 --chart` | hours per day as a chart, weekends shaded (an image in Ghostty, kitty or WezTerm) |
+| `./timesheet.py --project DP` | only project DP (also with `--list` and `--chart`) |
 | `./timesheet.py --other` | also time that is not work |
 | `./timesheet.py --configure` | projects, what belongs to them, places, history |
 | `./timesheet.py --settings` | day start, rounding and other numbers |
@@ -53,6 +55,7 @@ The second run asks once whether to keep a history beyond the 7 days macOS keeps
 - Hours are decimal.
 - A day runs from 03:00 to 03:00, so late-night work counts for the evening before.
 - `*` (yellow) marks an estimate.
+- Every view ends with hours per weekend (Sat+Sun), the weekend share, and average hours per day over all days, weekdays and weekend days.
 
 ## How it works
 
@@ -71,7 +74,7 @@ Design, findings and trade-offs: [docs/SPEC.md](docs/SPEC.md). Changes per versi
 
 ## Privacy
 
-- Nothing leaves your Mac.
+- Nothing leaves your Mac. The chart is drawn by macOS itself, in a temporary folder.
 - Only times and folders are read: never URLs, page titles, prompt text or file contents.
 - Places (opt-in) keep names of networks, screens and USB devices; serial numbers and hardware addresses only as a short hash. Never the Wi-Fi name or a location.
 - Saved data lives in `~/Library/Application Support/timesheet/` and `--uninstall` removes it.
@@ -88,7 +91,7 @@ rm timesheet.py              # the tool itself (or the cloned folder)
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests   # 44 tests, fake home folder, real data untouched
+python3 -m unittest discover -s tests   # 51 tests, fake home folder, real data untouched
 ruff check . && ruff format --check .   # lint and format (ruff 0.17)
 ```
 

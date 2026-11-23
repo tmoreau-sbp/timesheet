@@ -4,7 +4,9 @@ Everything runs against a throwaway home folder, fake logs and a fake crontab,
 so the tests never touch the real power log, browsers or crontab.
 """
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 import pty
@@ -17,7 +19,7 @@ import tempfile
 import termios
 import time as clock
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -929,12 +931,31 @@ class CommandLine(unittest.TestCase):
         lines = SCRIPT.read_text().splitlines()
         self.assertEqual(sum(ln.startswith('VERSION = "dev"') for ln in lines), 1)
 
+    def test_chart_project_filter_and_weekend_summary(self):
+        self.first_setup()
+        chart = self.run_tool("-n", "2", "--chart")
+        self.assertEqual(chart.returncode, 0, chart.stderr)
+        self.assertIn("Hours per day", chart.stdout)
+        self.assertIn("Per day (average)", chart.stdout)
+        self.assertRegex(chart.stdout, r"all days\s+2\s+1\.00\s+0\.00\s+1\.00")
+        for view in ((), ("--list",)):  # the summary is under every view
+            self.assertIn("Per day (average)", self.run_tool("-n", "2", *view).stdout)
+        only_b = self.run_tool("-n", "2", "--project", "b").stdout
+        self.assertNotRegex(only_b, r"(?m)^A\s")
+        self.assertRegex(only_b, r"(?m)^B\s")
+        wrong = self.run_tool("--project", "x")
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("unknown project: x", wrong.stderr)
+        self.assertNotEqual(self.run_tool("--chart", "--list").returncode, 0)
+
     def test_help_lists_only_the_user_options(self):
         result = self.run_tool("--help")
         for option in (
             "--weeks",
             "--days",
             "--list",
+            "--chart",
+            "--project",
             "--other",
             "--configure",
             "--settings",
@@ -943,6 +964,89 @@ class CommandLine(unittest.TestCase):
             self.assertIn(option, result.stdout)
         for hidden in ("--collect", "--pmset-file", "--archive"):
             self.assertNotIn(hidden, result.stdout)
+
+
+class Chart(unittest.TestCase):
+    """Hours per day as a chart, and the weekend summary under every view."""
+
+    def setUp(self):
+        # Sat 2026-10-03 .. Mon 2026-10-12; B on the first Sunday is estimated
+        self.days = [date(2026, 10, 3) + timedelta(days=i) for i in range(10)]
+        hours = {3: [("A", 1, False)], 4: [("B", 2, True)], 5: [("A", 4, False)]}
+        hours.update({10: [("A", 1, False)], 12: [("A", 2, False)]})
+        self.results = {}
+        for d in self.days:
+            start = datetime(d.year, d.month, d.day, 9)
+            self.results[d] = [
+                [start, start + timedelta(hours=h), label, est]
+                for label, h, est in hours.get(d.day, [])
+            ]
+        self.colors = ts.series_colors(["A", "B"], "dark")
+
+    def summary(self, work):
+        out = io.StringIO()
+        with mock.patch.object(ts, "COLOR", False), contextlib.redirect_stdout(out):
+            ts.print_weekends(self.days, self.results, work, self.colors)
+        return out.getvalue()
+
+    def test_hours_per_weekend_share_and_averages_per_day(self):
+        text = self.summary(["A", "B"])
+        self.assertRegex(text, r"Oct 03-04\s+1\.0\s+2\.0\*\s+3\.0\*")
+        self.assertRegex(text, r"Oct 10-11\s+1\.0\s+0\.0\s+1\.0")
+        self.assertRegex(text, r"total\s+2\.0\s+2\.0\*\s+4\.0\*")
+        self.assertRegex(text, r"share of the period\s+25%\s+100%\s+40%")
+        # 10 days: 6 weekdays (A 6h) and 4 weekend days (A 2h, B 2h estimated)
+        self.assertRegex(text, r"all days\s+10\s+0\.80\s+0\.20\*\s+1\.00\*")
+        self.assertRegex(text, r"weekdays\s+6\s+1\.00\s+0\.00\s+1\.00")
+        self.assertRegex(text, r"weekend days\s+4\s+0\.50\s+0\.50\*\s+1\.00\*")
+        self.assertNotIn("all work", self.summary(["A"]))  # one project: no total column
+
+    def test_weekends_are_cut_at_the_ends_of_the_period(self):
+        days = [date(2026, 10, 4) + timedelta(days=i) for i in range(7)]  # Sun .. Sat
+        sun, sat = date(2026, 10, 4), date(2026, 10, 10)
+        self.assertEqual(ts.weekends(days), [(sun, sun), (sat, sat)])
+
+    def test_svg_marks_weekends_saturdays_and_estimates(self):
+        per_day = ts.day_hours(self.days, self.results, ["A", "B"])
+        svg = ts.chart_svg(self.days, per_day, ["A", "B"], self.colors, "dark")
+        self.assertIn(">Sat Oct 3<", svg)
+        self.assertIn(">Sat Oct 10<", svg)
+        self.assertNotIn(">3.0h<", svg)  # no weekend totals on the chart: the table has them
+        self.assertEqual(svg.count('stroke-dasharray="3 3"'), 2)  # a dashed line per Saturday
+        self.assertIn('fill-opacity="0.45"', svg)  # the estimated hours
+        self.assertIn(">estimated<", svg)
+        self.assertNotIn("http", svg.replace('xmlns="http://www.w3.org/2000/svg"', ""))
+        # a project keeps its colour when shown alone
+        only_b = ts.chart_svg(self.days, per_day, ["B"], self.colors, "dark")
+        self.assertIn(f'fill="{ts.PALETTE["dark"][1]}"', only_b)
+        self.assertNotIn(f'fill="{ts.PALETTE["dark"][0]}"', only_b)
+
+    def test_text_chart_without_colour(self):
+        per_day = ts.day_hours(self.days, self.results, ["A", "B"])
+        with mock.patch.object(ts, "COLOR", False):
+            text = ts.text_chart(self.days, per_day, ["A", "B"], self.colors, "dark", 66)
+        lines = text.splitlines()
+        self.assertNotIn("3.0h", text)  # no weekend totals on the chart: the table has them
+        self.assertTrue(any("┊" in ln for ln in lines))  # where the second Saturday starts
+        self.assertIn("█", text)  # A
+        self.assertIn("▓", text)  # B
+        self.assertEqual(lines[-2].strip(), "*")  # the estimated Sunday
+        self.assertIn("Sat Oct 3", lines[-1])
+        self.assertIn("Sat Oct 10", lines[-1])
+        self.assertNotIn("\033", text)
+
+    def test_kitty_image_is_sent_in_chunks(self):
+        codes = ts.kitty_image(bytes(5000), 80, 20)
+        chunks = codes.split("\033\\")[:-1]
+        self.assertEqual(len(chunks), 2)  # 6668 base64 characters, 4096 per chunk
+        self.assertTrue(chunks[0].startswith("\033_Ga=T,f=100,c=80,r=20,m=1;"))
+        self.assertTrue(chunks[1].startswith("\033_Gm=0;"))
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists(ts.OSASCRIPT), "macOS only")
+    def test_macos_draws_the_png(self):
+        per_day = ts.day_hours(self.days, self.results, ["A", "B"])
+        png = ts.svg_to_png(ts.chart_svg(self.days, per_day, ["A", "B"], self.colors, "light"))
+        self.assertTrue(png and png.startswith(b"\x89PNG"))
 
 
 class ArrowKeys(unittest.TestCase):

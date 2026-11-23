@@ -38,6 +38,8 @@ Usage:
   timesheet.py                 work, last 4 weeks as Mon-Sun calendar
   timesheet.py -w 2            last 2 weeks
   timesheet.py -n 7 --list     last 7 days, one row per active period
+  timesheet.py -n 52 --chart   hours per day as a chart, weekends shaded
+  timesheet.py --project DP    only project DP (also with --list and --chart)
   timesheet.py --other         also show time that is not work
   timesheet.py --configure     projects, what belongs to them, history
   timesheet.py --settings      day start, rounding and other numbers
@@ -47,17 +49,22 @@ Safari history needs Full Disk Access for the terminal app.
 """
 
 import argparse
+import base64
 import bisect
+import fcntl
 import hashlib
+import html
 import json
 import os
 import re
 import shlex
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 from collections import Counter
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -1757,6 +1764,435 @@ def print_calendar(days, results, work, other, place=None):
     print(f"{len(days)} days: {summary(grand, work, other)}")
 
 
+# --- chart and weekend summary ------------------------------------------------------
+
+HOUR = timedelta(hours=1)
+# Categorical palette: the dataviz reference instance made gentler (orange chroma
+# 0.17 -> 0.12, the others 10-20 % less), light and dark steps in fixed order. It
+# passes the dataviz validator in both modes (adjacent CVD dE >= 8, normal >= 15).
+# A project keeps its slot whatever is shown; past eight, neutral gray.
+PALETTE = {
+    "light": (
+        "#407ac4",
+        "#c3723a",
+        "#49aa80",
+        "#e2a649",
+        "#dc85a4",
+        "#2e7f2a",
+        "#6259c1",
+        "#d35b56",
+    ),
+    "dark": (
+        "#4488dc",
+        "#b1642f",
+        "#329c72",
+        "#c48729",
+        "#ce5982",
+        "#2ca129",
+        "#9087e1",
+        "#df6d6c",
+    ),
+}
+# card, weekend band, grid, text, muted text
+SURFACES = {
+    "light": ("#fcfcfb", "#efeee9", "#e1e0d9", "#0b0b0b", "#898781"),
+    "dark": ("#1a1a19", "#262624", "#2c2c2a", "#f0efec", "#898781"),
+}
+NEUTRAL = "#898781"  # other, and series past the palette
+PATTERNS = "█▓▒░"  # series without colour (NO_COLOR, pipes)
+CHART_FONT = "Helvetica Neue"
+OSASCRIPT = "/usr/bin/osascript"
+# macOS draws the PNG: AppKit loads the SVG and renders it at 2x (JavaScript for Automation).
+SVG_TO_PNG = """ObjC.import('AppKit');
+function run(argv) {
+  const img = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
+  if (!img || img.isNil()) throw new Error('svg unreadable');
+  const w = img.size.width, h = img.size.height;
+  const rep = $.NSBitmapImageRep.alloc
+    .initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
+      null, w * 2, h * 2, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
+  rep.size = $.NSMakeSize(w, h);
+  $.NSGraphicsContext.saveGraphicsState;
+  $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep));
+  img.drawInRect($.NSMakeRect(0, 0, w, h));
+  $.NSGraphicsContext.restoreGraphicsState;
+  const png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+  png.writeToFileAtomically(argv[1], true);
+}
+"""
+
+
+def series_colors(names, theme):
+    """Label -> colour: projects (then meetings) in their configured order, other neutral."""
+    slots = PALETTE[theme]
+    colors = {n: slots[i] if i < len(slots) else NEUTRAL for i, n in enumerate(names)}
+    colors[OTHER] = NEUTRAL
+    return colors
+
+
+def system_theme():
+    """dark when macOS is in dark mode, else light."""
+    style = command_output(["/usr/bin/defaults", "read", "-g", "AppleInterfaceStyle"])
+    return "dark" if style.strip() == "Dark" else "light"
+
+
+def day_hours(days, results, labels):
+    """{day: {label: (hours, estimated hours)}} for the labels asked for."""
+    out = {}
+    for d in days:
+        totals = totals_of(results[d])
+        out[d] = {k: (totals[k][0] / HOUR, totals[k][1] / HOUR) for k in labels if k in totals}
+    return out
+
+
+def weekends(days):
+    """[(Saturday, Sunday)] in days, cut to the period (a lone Sunday or Saturday)."""
+    out = []
+    for d in days:
+        if d.weekday() == 5 or (d.weekday() == 6 and d == days[0]):
+            out.append((d, min(d + timedelta(days=6 - d.weekday()), days[-1])))
+    return out
+
+
+def axis_top(per_day):
+    """Hours at the top of the chart: 12, or the longest day rounded up to an even hour."""
+    longest = max((sum(h for h, _ in day.values()) for day in per_day.values()), default=0)
+    return max(12, 2 * -(-int(longest + 0.999) // 2))
+
+
+def swatch(color):
+    """A coloured square before a name on a terminal; nothing without colour."""
+    if not COLOR:
+        return ""
+    r, g, b = (int(color[i : i + 2], 16) for i in (1, 3, 5))
+    return f"\033[38;2;{r};{g};{b}m■\033[0m "
+
+
+def print_weekends(days, results, work, colors):
+    """Hours per weekend (Sat+Sun) and per day on average, for each project shown."""
+    if not work:
+        return
+    per_day = day_hours(days, results, work)
+    cols = work + (["all work"] if len(work) > 1 else [])
+
+    def hours_of(group, k):
+        labels = work if k == "all work" else [k]
+        total = sum(per_day[d][x][0] for d in group for x in labels if x in per_day[d])
+        est = sum(per_day[d][x][1] for d in group for x in labels if x in per_day[d])
+        return total, est
+
+    width = max(9, max(len(k) for k in cols) + 3)
+
+    def heading(k):
+        mark = swatch(colors.get(k, NEUTRAL)) if k != "all work" else ""
+        return " " * (width - len(k) - (2 if mark else 0)) + mark + k
+
+    head = "".join(heading(k) for k in cols)
+    pairs = weekends(days)
+    if pairs:
+        print(f"\n{'Weekends (Sat+Sun)':<22}{head}")
+        group_all = []
+        for sat, sun in pairs:
+            group = [d for d in days if sat <= d <= sun]
+            group_all += group
+            name = f"{sat:%b %d}" + (
+                "" if sun == sat else f"-{sun:%d}" if sun.month == sat.month else f"-{sun:%b %d}"
+            )
+            print(
+                f"  {name:<20}"
+                + "".join(
+                    cell(f"{t:.1f}", e > 0, width) for t, e in (hours_of(group, k) for k in cols)
+                )
+            )
+        print(
+            f"  {'total':<20}"
+            + "".join(
+                cell(f"{t:.1f}", e > 0, width) for t, e in (hours_of(group_all, k) for k in cols)
+            )
+        )
+        shares = []
+        for k in cols:
+            weekend, whole = hours_of(group_all, k)[0], hours_of(days, k)[0]
+            shares.append(f"{weekend / whole:.0%}" if whole else "-")
+        print(f"  {'share of the period':<20}" + "".join(f"{s} ".rjust(width) for s in shares))
+    groups = [
+        ("all days", days),
+        ("weekdays", [d for d in days if d.weekday() < 5]),
+        ("weekend days", [d for d in days if d.weekday() >= 5]),
+    ]
+    print(f"\n{'Per day (average)':<16}{'days':>6}{head}")
+    for name, group in groups:
+        if not group:
+            continue
+        values = (hours_of(group, k) for k in cols)
+        print(
+            f"  {name:<14}{len(group):>6}"
+            + "".join(cell(f"{t / len(group):.2f}", e > 0, width) for t, e in values)
+        )
+
+
+def chart_svg(days, per_day, labels, colors, theme, width=1100, height=380, scale=1.0):
+    """Stacked hours per day as SVG, in design units (height 380) scaled to pixels: one
+    column per day in label order, weekends shaded, a dashed line and the date where
+    each Saturday starts, estimated hours lighter."""
+    surface, band, grid, text, muted = SURFACES[theme]
+    left, right, top, bottom = 44, 12, 40, 30
+    plot_w, plot_h = width - left - right, height - top - bottom
+    top_h = axis_top(per_day)
+    col = plot_w / len(days)
+    bar = col * 0.72
+
+    def y(h):
+        return top + plot_h - h / top_h * plot_h
+
+    def label(x, y_, size, color, anchor, words):
+        return (
+            f'<text x="{x:.1f}" y="{y_:.1f}" font-size="{size}" text-anchor="{anchor}" '
+            f'fill="{color}">{html.escape(words)}</text>'
+        )
+
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width * scale:.0f}" '
+        f'height="{height * scale:.0f}" viewBox="0 0 {width:.1f} {height}" '
+        f'font-family="{CHART_FONT}">',
+        f'<rect width="{width:.1f}" height="{height}" rx="10" fill="{surface}"/>',
+    ]
+    # Every k-th Saturday is labelled, so dates never overlap.
+    every = max(1, -(-64 // max(1, int(7 * col))))
+    shown = [sat for n, (sat, _) in enumerate(weekends(days)) if n % every == 0]
+    for sat, sun in weekends(days):
+        x = left + days.index(sat) * col
+        span = (sun - sat).days + 1
+        out.append(
+            f'<rect x="{x:.1f}" y="{top}" width="{col * span:.1f}" height="{plot_h}" '
+            f'fill="{band}"/>'
+        )
+    step = 2 if top_h <= 16 else 4
+    for h in range(0, top_h + 1, step):
+        out.append(
+            f'<line x1="{left}" y1="{y(h):.1f}" x2="{width - right:.1f}" y2="{y(h):.1f}" '
+            f'stroke="{grid}"/>'
+        )
+        out.append(label(left - 6, y(h) + 4, 11, muted, "end", f"{h}h"))
+    for i, d in enumerate(days):
+        x = left + i * col + (col - bar) / 2
+        segs = []
+        for k in labels:
+            h, est = per_day[d].get(k, (0, 0))
+            segs += [(h - est, colors.get(k, NEUTRAL), 1), (est, colors.get(k, NEUTRAL), 0.45)]
+        segs = [s for s in segs if s[0] > 0]
+        base = 0.0
+        for n, (h, color, opacity) in enumerate(segs):
+            y0, y1 = y(base) - (1 if n else 0), y(base + h)  # a thin surface gap between segments
+            fill = f'fill="{color}"' + (f' fill-opacity="{opacity}"' if opacity < 1 else "")
+            r = min(3, bar / 2, (y0 - y1) / 2)
+            if n == len(segs) - 1 and r > 0.5:  # rounded top on the top segment
+                out.append(
+                    f'<path d="M{x:.1f} {y0:.1f} V{y1 + r:.1f} '
+                    f"Q{x:.1f} {y1:.1f} {x + r:.1f} {y1:.1f} H{x + bar - r:.1f} "
+                    f"Q{x + bar:.1f} {y1:.1f} {x + bar:.1f} {y1 + r:.1f} "
+                    f'V{y0:.1f} Z" {fill}/>'
+                )
+            else:
+                out.append(
+                    f'<rect x="{x:.1f}" y="{y1:.1f}" width="{bar:.1f}" '
+                    f'height="{max(0.5, y0 - y1):.1f}" {fill}/>'
+                )
+            base += h
+    for sat in (d for d in shown if d.weekday() == 5):
+        x = left + days.index(sat) * col
+        out.append(
+            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_h + 6}" stroke="{muted}" '
+            f'stroke-dasharray="3 3"/>'
+        )
+        out.append(
+            label(x + 3, height - bottom + 18, 11, muted, "start", f"Sat {sat:%b} {sat.day}")
+        )
+    x = left
+    legend = [(k, colors.get(k, NEUTRAL), 1) for k in labels]
+    if any(e for day in per_day.values() for _, e in day.values()):
+        legend.append(("estimated", colors.get(labels[0], NEUTRAL), 0.45))
+    legend.append(("weekend", band, 1))
+    for name, color, opacity in legend:
+        extra = f' fill-opacity="{opacity}"' if opacity < 1 else ""
+        out.append(
+            f'<rect x="{x}" y="14" width="10" height="10" rx="2" fill="{color}"{extra} '
+            f'stroke="{grid}"/>'
+        )
+        out.append(label(x + 15, 23, 12, text, "start", name))
+        x += 15 + 7 * len(name) + 18
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def svg_to_png(svg):
+    """PNG bytes of an SVG, drawn by macOS; None when that isn't possible."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp) / "chart.svg", Path(tmp) / "chart.png"
+        src.write_text(svg)
+        try:
+            subprocess.run(
+                [OSASCRIPT, "-l", "JavaScript", "-e", SVG_TO_PNG, str(src), str(dst)],
+                capture_output=True,
+                check=True,
+                timeout=SLOW_TIMEOUT,
+            )
+            return dst.read_bytes()
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+
+def kitty_image(png, cols, rows):
+    """Escape codes that show PNG bytes over cols x rows cells (Kitty graphics protocol)."""
+    data = base64.b64encode(png).decode()
+    chunks = [data[i : i + 4096] for i in range(0, len(data), 4096)] or [""]
+    out = []
+    for i, chunk in enumerate(chunks):
+        keys = f"a=T,f=100,c={cols},r={rows}," if i == 0 else ""
+        out.append(f"\033_G{keys}m={int(i < len(chunks) - 1)};{chunk}\033\\")
+    return "".join(out)
+
+
+def can_show_images():
+    """A terminal that shows Kitty graphics (Ghostty, kitty, WezTerm), not through tmux."""
+    if not COLOR or sys.platform != "darwin" or os.environ.get("TMUX") or os.environ.get("STY"):
+        return False
+    env = os.environ
+    return (
+        env.get("TERM_PROGRAM") in ("ghostty", "WezTerm")
+        or env.get("TERM") == "xterm-kitty"
+        or "KITTY_WINDOW_ID" in env
+    )
+
+
+def terminal_cells():
+    """(columns, rows, cell width px, cell height px) of the terminal; guesses if unknown."""
+    try:
+        rows, cols, xpix, ypix = struct.unpack(
+            "HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, bytes(8))
+        )
+    except (OSError, ValueError):
+        rows = cols = xpix = ypix = 0
+    if not cols or not rows:
+        size = shutil.get_terminal_size()
+        cols, rows = size.columns, size.lines
+    return cols, rows, (xpix / cols if xpix else 10.0), (ypix / rows if ypix else 20.0)
+
+
+def blend(color, background, amount):
+    """color moved amount of the way towards background (lighter estimates in text)."""
+    c = [int(color[i : i + 2], 16) for i in (1, 3, 5)]
+    b = [int(background[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(c, b))
+
+
+def text_chart(days, per_day, labels, colors, theme, width):
+    """The chart in text: a column per day, 12 rows. With colour, 1/8-row steps in 24-bit
+    colour and weekends shaded; without, whole rows in a pattern per project. A ┊ marks
+    where each Saturday starts, * an estimated day."""
+    note = ""
+    if len(days) > width - 6:
+        days, note = days[-(width - 6) :], f"  (last {width - 6} days: widen the window for more)"
+    per = max(1, (width - 6) // len(days))
+    bar_w = per - 1 if per > 1 else 1
+    surface, band, _, _, muted = SURFACES[theme]
+    top_h, rows = axis_top(per_day), 12
+    unit = top_h / rows
+
+    def esc(fg, bg):
+        f = [int(fg[i : i + 2], 16) for i in (1, 3, 5)]
+        b = [int(bg[i : i + 2], 16) for i in (1, 3, 5)]
+        return f"\033[38;2;{f[0]};{f[1]};{f[2]}m\033[48;2;{b[0]};{b[1]};{b[2]}m"
+
+    stacks = {}
+    for d in days:
+        segs, base = [], 0.0
+        for n, k in enumerate(labels):
+            h, est = per_day[d].get(k, (0, 0))
+            color = colors.get(k, NEUTRAL)
+            bg = band if d.weekday() >= 5 else surface
+            for part, c in ((h - est, color), (est, blend(color, bg, 0.55))):
+                if part > 0:
+                    segs.append((base, base + part, c, PATTERNS[n % len(PATTERNS)]))
+                    base += part
+        stacks[d] = segs
+
+    def cell_at(d, lo, hi):
+        bg = band if d.weekday() >= 5 else surface
+        inside = [s for s in stacks[d] if s[1] > lo and s[0] < hi]
+        if not COLOR:
+            mid = [s for s in inside if s[0] <= (lo + hi) / 2 < s[1]]
+            return mid[0][3] if mid else " "
+        if not inside:
+            return esc(bg, bg) + " "
+        full = [s for s in inside if s[0] <= lo and s[1] >= hi]
+        if full:
+            return esc(full[0][2], bg) + "█"
+        lower = inside[0]
+        upper = next((s for s in inside if s[1] >= hi), None)
+        eighths = max(1, min(8 if upper is None else 7, round((lower[1] - lo) / unit * 8)))
+        return esc(lower[2], upper[2] if upper else bg) + " ▁▂▃▄▅▆▇█"[eighths]
+
+    def gap(i, d):
+        sat_next = i + 1 < len(days) and days[i + 1].weekday() == 5
+        mark = "┊" if sat_next else " "
+        if not COLOR:
+            return mark
+        bg = band if d.weekday() >= 5 else surface
+        return esc(muted, bg) + mark
+
+    reset = "\033[0m" if COLOR else ""
+    lines = []
+    for r in range(rows - 1, -1, -1):
+        lo, hi = r * unit, (r + 1) * unit
+        line = f"{hi:>3.0f}h " if (r + 1) % 2 == 0 else "     "
+        for i, d in enumerate(days):
+            line += cell_at(d, lo, hi) * bar_w + (gap(i, d) if per > 1 else "") + reset
+        lines.append(line)
+    stars = "".join(
+        ("*" if any(e for _, e in per_day[d].values()) else " ").ljust(per) for d in days
+    )
+    if stars.strip():
+        lines.append("     " + stars.rstrip())
+    below = [" "] * (per * len(days) + 12)
+    for i, d in enumerate(days):
+        if d.weekday() == 5:
+            text = f"Sat {d:%b} {d.day}"
+            start = max(0, i * per - 1)
+            if all(ch == " " for ch in below[max(0, start - 1) : start + len(text)]):
+                below[start : start + len(text)] = text
+    lines.append("     " + "".join(below).rstrip() + note)
+    return "\n".join(lines)
+
+
+def print_chart(days, results, work, other, colors, theme):
+    """Hours per day as a chart: an image on terminals that show them, else text."""
+    shown = work + ([OTHER] if other else [])
+    per_day = day_hours(days, results, shown)
+    legend = "  ".join(
+        (swatch(colors.get(k, NEUTRAL)) if COLOR else PATTERNS[n % len(PATTERNS)] + " ") + k
+        for n, k in enumerate(shown)
+    )
+    print(f"Hours per day {days[0]} .. {days[-1]}   {legend}")
+    cols, rows, cell_w, cell_h = terminal_cells()
+    png = None
+    if can_show_images():
+        img_rows = max(8, min(24, rows - 4))  # full width, never taller than the screen
+        px_w, px_h = cols * cell_w, img_rows * cell_h
+        svg = chart_svg(
+            days, per_day, shown, colors, theme, width=380 * px_w / px_h, scale=px_h / 760
+        )
+        png = svg_to_png(svg)
+        if png:
+            print(kitty_image(png, cols, img_rows))
+    if not png:
+        print(text_chart(days, per_day, shown, colors, theme, cols))
+    grand = {}
+    for d in days:
+        add_to(grand, totals_of(results[d]))
+    print(f"\n{len(days)} days: {summary(grand, work, other)}")
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -1765,7 +2201,10 @@ def main():
     )
     p.add_argument("-w", "--weeks", type=int, help="show the last N weeks, Mon-Sun")
     p.add_argument("-n", "--days", type=int, help="show the last N days instead")
-    p.add_argument("--list", action="store_true", help="one row per work period")
+    view = p.add_mutually_exclusive_group()
+    view.add_argument("--list", action="store_true", help="one row per work period")
+    view.add_argument("--chart", action="store_true", help="hours per day as a chart")
+    p.add_argument("--project", help="only these projects, comma-separated (e.g. DP or DP,TAT)")
     p.add_argument("--other", action="store_true", help="also show time that is not work")
     p.add_argument(
         "--configure", action="store_true", help="projects, what belongs to them, history"
@@ -1871,6 +2310,17 @@ def main():
         and any(r[2] == projects.meetings for rows in results.values() for r in rows)
     ):
         work.append(projects.meetings)
+    # Colours follow the configured order, so a project keeps its colour under --project.
+    meetings = [projects.meetings] if isinstance(projects.meetings, str) else []
+    colors_for = list(projects.names) + [m for m in meetings if m not in projects.names]
+    if args.project:
+        wanted = {n.strip().lower() for n in args.project.split(",") if n.strip()}
+        unknown = sorted(wanted - {w.lower() for w in work})
+        if unknown:
+            sys.exit(f"unknown project: {', '.join(unknown)} (projects: {', '.join(work)})")
+        work = [w for w in work if w.lower() in wanted]
+    theme = system_theme()
+    colors = series_colors(colors_for, theme)
     print(describe(config) if config.get("projects") else "no projects set up: run --configure")
     hour = setting(config, "day_start")
     print(f"day = {hour:02d}:00-{hour:02d}:00, hours in decimal")
@@ -1881,8 +2331,11 @@ def main():
     print()
     if args.list:
         print_list(days, results, work, args.other, place)
+    elif args.chart:
+        print_chart(days, results, work, args.other, colors, theme)
     else:
         print_calendar(days, results, work, args.other, place)
+    print_weekends(days, results, work, colors)
 
 
 if __name__ == "__main__":
