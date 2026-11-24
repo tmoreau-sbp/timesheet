@@ -30,7 +30,7 @@ uvx ruff@0.17.0 check . && uvx ruff@0.17.0 format .   # or: pipx run ruff==0.17.
 
 ## Commit messages
 
-Use [Conventional Commits](https://www.conventionalcommits.org). The release notes and `CHANGELOG.md` are written from them, and the `commits` CI job rejects anything else.
+Use [Conventional Commits](https://www.conventionalcommits.org). The release notes are written from them, and the `commits` CI job rejects anything else.
 
 ```text
 feat: add Zoom calls as meetings
@@ -70,7 +70,6 @@ The workflow then:
 - stamps the version into `timesheet.py` (shown in `--help`)
 - signs it with a GitHub build attestation
 - publishes a release holding only `timesheet.py`, its signature (`.sigstore.json`) and a SHA-256 checksum, with notes written from the commits
-- commits the regenerated `CHANGELOG.md` to `main` (pull afterwards)
 
 To see which version the commits call for (`feat` → minor, `fix` → patch, `!` → major): `git cliff --bumped-version`.
 
