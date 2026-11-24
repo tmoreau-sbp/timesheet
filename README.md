@@ -70,7 +70,7 @@ The second run asks once whether to keep a history beyond the 7 days macOS keeps
 - **History:** macOS keeps ~7 days of power log. With history on, an hourly cron job saves it (1 year, at most ~12 MB). Days before that are estimated from activity alone and marked `*`.
 - **Where (optional):** the hourly job can also note the network, VPN, screens and USB devices, one line each time they change (under 1 MB a year). Label each setup (network + screens) in `--configure`: home, office, a customer. Several setups can be the same place, and a new one is guessed from its network, screens or USB devices. Link a place to a project if you like: work there with no folder, profile or call counts for it. The calendar gets a `place` row and `--list` rows end with `@label`.
 
-Design, findings and trade-offs: [docs/SPEC.md](docs/SPEC.md). Changes per version: [CHANGELOG.md](CHANGELOG.md), written automatically at each release.
+Design, findings and trade-offs: [docs/SPEC.md](docs/SPEC.md). Changes per version: the [releases](https://github.com/tmoreau-sbp/timesheet/releases), with notes written from the commits.
 
 ## Privacy
 

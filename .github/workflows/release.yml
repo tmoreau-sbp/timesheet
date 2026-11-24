@@ -10,7 +10,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write      # create the release, commit CHANGELOG.md
+      contents: write      # create the release
       id-token: write      # sign the attestation
       attestations: write  # store the attestation
     steps:
@@ -40,13 +40,6 @@ jobs:
           args: --latest --strip all
         env:
           OUTPUT: notes.md
-      - name: Changelog
-        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
-        with:
-          version: v2.14.2
-          args: --verbose  # full CHANGELOG.md
-        env:
-          OUTPUT: CHANGELOG.md
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,13 +50,3 @@ jobs:
           (cd dist && sha256sum timesheet.py > timesheet.py.sha256)
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
-      - name: Commit CHANGELOG.md to main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          # Through the API, so GitHub signs the commit.
-          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md?ref=main" --jq .sha 2>/dev/null || true)
-          gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md" \
-            -f message="docs(changelog): $TAG" -f branch=main \
-            -f content="$(base64 -w0 CHANGELOG.md)" ${current:+-f sha="$current"}

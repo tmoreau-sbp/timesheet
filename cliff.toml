@@ -1,12 +1,11 @@
-# git-cliff: CHANGELOG.md and release notes from Conventional Commits (https://git-cliff.org/docs/configuration)
+# git-cliff: release notes and the commit check, from Conventional Commits (https://git-cliff.org/docs/configuration)
 
 [changelog]
 header = """
 # Changelog
 
-All notable changes to timesheet. Written automatically at each release by
-[git-cliff](https://git-cliff.org) from [Conventional Commits](https://www.conventionalcommits.org);
-don't edit by hand.
+All notable changes to timesheet, written by [git-cliff](https://git-cliff.org)
+from [Conventional Commits](https://www.conventionalcommits.org).
 """
 body = """
 {% if version %}\

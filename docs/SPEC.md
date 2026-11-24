@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Implemented (v1) |
 | **Owner** | [@tmoreau-sbp](https://github.com/tmoreau-sbp) |
-| **Updated** | 2026-11-23 |
+| **Updated** | 2026-11-24 |
 | **Scope** | Design and rationale. Usage is in the [README](../README.md). |
 
 ## 1. Summary
@@ -60,7 +60,7 @@ It is a single Python 3.9+ standard-library script, run by the user in a termina
 | R23 | Security: `SECURITY.md`, CodeQL, every action pinned to a SHA, 10-day cool-off on new releases (pinact) | done |
 | R24 | Releases that contain only the tool, with the version stamped in, triggered by a tag | done |
 | R25 | Conventional Commits, enforced by a CI job | done |
-| R26 | `CHANGELOG.md` and release notes written automatically from the commits | done |
+| R26 | Release notes written automatically from the commits | done; no `CHANGELOG.md` since v0.1.0 (5.14) |
 | R27 | Time spent on a browser page counts for its profile's project, for users who work mostly in a browser | done |
 | R28 | Other AI coding agents (Codex, Gemini CLI) count like Claude Code | done |
 | R29 | Tell home, office and customer sites apart: the hourly job notes network, VPN, screens and USB devices (opt-in), and labels show per day and per row | done; to tune once there is data |
@@ -494,9 +494,8 @@ It then prints the command that removes the tool file itself (`rm <path to times
 1. Run the test suite.
 2. Stamp the version: `VERSION = "dev"` becomes `VERSION = "X.Y.Z"`. The version shows at the end of `--help` (`timesheet X.Y.Z`), so no `--version` option is needed. A test makes sure the line exists exactly once.
 3. Sign `timesheet.py` with `actions/attest-build-provenance`, GitHub's own action. It writes a Sigstore-signed SLSA build provenance, stored by GitHub and returned as a bundle.
-4. Write the release notes and the full `CHANGELOG.md` with git-cliff (5.14). GitHub's "Full changelog" link is appended to the notes.
+4. Write the release notes with git-cliff (5.14). GitHub's "Full changelog" link is appended to the notes.
 5. Create the release with `gh release create --verify-tag --notes-file notes.md --generate-notes`. The `gh` CLI is already on GitHub's runners, so no third-party release action is needed.
-6. Commit the regenerated `CHANGELOG.md` to `main` as `docs(changelog): vX.Y.Z`. The commit goes through the GitHub contents API, so GitHub signs it ("Verified") and no git credentials are kept in the workspace. Pushes made with the workflow token don't start other workflows, so this can't loop.
 
 **Release files:**
 
@@ -515,7 +514,7 @@ chmod +x timesheet.py
 gh attestation verify timesheet.py -R tmoreau-sbp/timesheet   # optional
 ```
 
-**Permissions.** The release job only gets `contents: write` (release + changelog commit), `id-token: write` and `attestations: write`. The tag name reaches shell steps through `env:`, never inline, so it can't inject commands.
+**Permissions.** The release job only gets `contents: write` (to create the release), `id-token: write` and `attestations: write`. The tag name reaches shell steps through `env:`, never inline, so it can't inject commands.
 
 **Scorecard.** A signature among the release files scores 8/10 on Signed-Releases. 10/10 would need an `*.intoto.jsonl` file from the SLSA generator, which must be referenced by tag rather than SHA and so conflicts with the pinact rule.
 
@@ -536,8 +535,8 @@ gh attestation verify timesheet.py -R tmoreau-sbp/timesheet   # optional
 - **Dependabot:** writes `ci: bump …` messages (`commit-message.prefix: ci`).
 
 **Changelog.**
-- Each tag regenerates the whole `CHANGELOG.md` (newest version first, with dates) and the release notes for that version. Both come from the same `cliff.toml`, and the release workflow commits the file to `main` (5.13).
-- It is never edited by hand.
+- Each tag writes the release notes for that version from `cliff.toml`; the release pages together are the changelog.
+- There is no `CHANGELOG.md` file. The release workflow was meant to commit one to `main`, but at v0.1.0, the first release, the pull-request-only rule on `main` refused it (`Changes must be made through a pull request`, HTTP 409). The release itself was already published, so only that step failed. `git cliff` still prints the full changelog locally.
 - `git cliff --bumped-version` shows the version the commits call for: `feat` raises the minor number, `fix` the patch number, `!` the major.
 
 **Tested locally with git-cliff 2.14.2:**
@@ -737,6 +736,7 @@ One column per day, projects stacked bottom-up in their configured order, the y 
 | Place probes | run on macOS 26: Wi-Fi with a VPN up, one external screen, 6 USB devices; 0.11 s, 376 bytes per record. Ethernet and customer networks not seen yet |
 | Timeouts | checked by the tests with hanging fake commands |
 | CI | lint, Python 3.9 and 3.14, pinact on every push |
+| Release | v0.1.0 (2026-11-24): checksum OK, `gh attestation verify` passes, `--help` ends with `timesheet 0.1.0` |
 | pinact 10-day rule | checked: pinact 4.0.0 passes as committed and fails (`min-age violation`, exit 2) with a 3-day-old CodeQL release |
 | CodeQL | no alerts |
 | OpenSSF Scorecard | 6.4 / 10. The rest needs branch protection, reviewed pull requests or project age |
